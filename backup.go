@@ -16,7 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/coreos/go-etcd/etcd"
-	"github.com/crewjam/ec2cluster"
+	"github.com/opsline/ec2cluster"
 )
 
 // backupService invokes backupOnce() periodically if the current node is the cluster leader.
@@ -29,25 +29,24 @@ func backupService(s *ec2cluster.Cluster, backupBucket, backupKey, dataDir strin
 	ticker := time.Tick(interval)
 	for {
 		<-ticker
-		path := "stats/self"
-		method := http.MethodGet
-		resp, err := getApiResponse(*instance.PrivateIpAddress, *instance.InstanceId, path, method)
+
+		resp, err := http.Get(fmt.Sprintf("http://%s:2379/v2/stats/self", *instance.PrivateIpAddress))
 		if err != nil {
-			return fmt.Errorf("%s: %s://%s:%s/v2/%s: %s", *instance.InstanceId, clientProtocol,
-				*instance.PrivateIpAddress, *etcdClientPort, path, err)
+			return fmt.Errorf("%s: http://%s:2379/v2/stats/self: %s", *instance.InstanceId,
+				*instance.PrivateIpAddress, err)
 		}
 
 		nodeState := etcdState{}
 		if err := json.NewDecoder(resp.Body).Decode(&nodeState); err != nil {
-			return fmt.Errorf("%s: %s://%s:%s/v2/%s: %s", *instance.InstanceId, clientProtocol,
-				*instance.PrivateIpAddress, *etcdClientPort, path, err)
+			return fmt.Errorf("%s: http://%s:2379/v2/stats/self: %s", *instance.InstanceId,
+				*instance.PrivateIpAddress, err)
 		}
 
 		// if the cluster has a leader other than the current node, then don't do the
 		// backup.
 		if nodeState.LeaderInfo.Leader != "" && nodeState.ID != nodeState.LeaderInfo.Leader {
-			log.Printf("backup: %s: %s://%s:%s/v2/%s: not the leader", *instance.InstanceId, clientProtocol,
-				*instance.PrivateIpAddress, *etcdClientPort, path)
+			log.Printf("backup: %s: http://%s:2379/v2/stats/self: not the leader", *instance.InstanceId,
+				*instance.PrivateIpAddress)
 			<-ticker
 			continue
 		}
@@ -111,12 +110,11 @@ func dumpEtcdNode(key string, etcdClient *etcd.Client, w io.Writer) (int, error)
 // success it emits a CloudWatch metric for the number of keys backed up. The absence
 // of data on this metric indicates the backup has failed.
 func backupOnce(s *ec2cluster.Cluster, backupBucket, backupKey, dataDir string) error {
-	var etcdClient *etcd.Client
 	instance, err := s.Instance()
 	if err != nil {
 		return err
 	}
-	etcdClient, _ = getEtcdClient([]string{fmt.Sprintf("https://%s:%s", *instance.PrivateIpAddress, *etcdClientPort)})
+	etcdClient := etcd.NewClient([]string{fmt.Sprintf("http://%s:2379", *instance.PrivateIpAddress)})
 	if success := etcdClient.SyncCluster(); !success {
 		return fmt.Errorf("backupOnce: cannot sync machines")
 	}
@@ -147,10 +145,10 @@ func backupOnce(s *ec2cluster.Cluster, backupBucket, backupKey, dataDir string) 
 		ACL:                  aws.String(s3.ObjectCannedACLPrivate),
 	})
 	if err != nil {
-		return fmt.Errorf("upload s3://%s/%s: %s", backupBucket, backupKey, err)
+		return fmt.Errorf("upload s3://%s%s: %s", backupBucket, backupKey, err)
 	}
 
-	log.Printf("backup written to s3://%s/%s (%d values)", backupBucket, backupKey,
+	log.Printf("backup written to s3://%s%s (%d values)", backupBucket, backupKey,
 		valueCount)
 
 	cloudwatch.New(s.AwsSession).PutMetricData(&cloudwatch.PutMetricDataInput{
@@ -216,12 +214,11 @@ func loadEtcdNode(etcdClient *etcd.Client, r io.Reader) error {
 
 // restoreBackup reads the backup from S3 and applies it to the current cluster.
 func restoreBackup(s *ec2cluster.Cluster, backupBucket, backupKey, dataDir string) error {
-	var etcdClient *etcd.Client
 	instance, err := s.Instance()
 	if err != nil {
 		return err
 	}
-	etcdClient, _ = getEtcdClient([]string{fmt.Sprintf("https://%s:%s", *instance.PrivateIpAddress, *etcdClientPort)})
+	etcdClient := etcd.NewClient([]string{fmt.Sprintf("http://%s:2379", *instance.PrivateIpAddress)})
 	if success := etcdClient.SyncCluster(); !success {
 		return fmt.Errorf("restore: cannot sync machines")
 	}
